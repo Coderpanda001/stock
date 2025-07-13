@@ -10,24 +10,23 @@ from sklearn.preprocessing import MinMaxScaler
 # Load the pre-trained model
 model = load_model("stockpredict.keras")
 
-def predict_and_suggest_action(data_test_scale, scaler):
+def predict_and_suggest_action(data_test_scale, scaler, window_size):
     x = []
     y = []
 
-    for i in range(100, data_test_scale.shape[0]):
-        x.append(data_test_scale[i - 100:i])
+    for i in range(window_size, data_test_scale.shape[0]):
+        x.append(data_test_scale[i - window_size:i])
         y.append(data_test_scale[i, 0])
 
     x, y = np.array(x), np.array(y)
 
     predict = model.predict(x)
 
-    scale = 1 / scaler.scale_
+    # Inverse transform
+    predict = scaler.inverse_transform(predict)
+    y = scaler.inverse_transform(y.reshape(-1, 1)).flatten()
 
-    predict = predict * scale
-    y = y * scale
-
-    return predict, y
+    return predict.flatten(), y
 
 def suggest_action(predicted_price, current_price):
     if predicted_price > current_price:
@@ -36,40 +35,50 @@ def suggest_action(predicted_price, current_price):
         return "Sell"
 
 def main():
-    # Define header content
-    st.title('Stock Market Dashboard')
+    st.title('📈 Stock Market Dashboard')
     st.markdown("---")
 
-    # Date range selector for selecting the data range to predict
+    # Date range
     st.subheader("Select Data Range to Predict")
     start_date = st.date_input("Start Date", pd.to_datetime('2012-01-01'))
     end_date = st.date_input("End Date", pd.to_datetime('2022-12-31'))
 
-    # Dropdown for selecting stock symbol
+    # Convert to datetime in case they return datetime.date
+    start_date = pd.to_datetime(start_date)
+    end_date = pd.to_datetime(end_date)
+
+    # Select stock
     selected_stock = st.selectbox('Select Stock Symbol', ['AAPL', 'GOOG', 'MSFT', 'AMZN'])
 
     data = yf.download(selected_stock, start=start_date, end=end_date)
 
+    if data.empty:
+        st.error("No data found. Try a different date range or stock.")
+        return
+
     st.write(data)
 
     data_train = pd.DataFrame(data.Close[0: int(len(data) * 0.80)])
-    data_test = pd.DataFrame(data.Close[int(len(data) * 0.80): len(data)])
+    data_test = pd.DataFrame(data.Close[int(len(data) * 0.80):])
 
     scaler = MinMaxScaler(feature_range=(0, 1))
+    scaler.fit(data_train)
 
-    pas_100_days = data_train.tail(100)
-    data_test = pd.concat([pas_100_days, data_test], ignore_index=True)
-    data_test_scale = scaler.fit_transform(data_test)
+    # Model's input window size
+    window_size = model.input_shape[1]
 
-    # Predict and suggest action
-    predict, y = predict_and_suggest_action(data_test_scale, scaler)
-    suggested_action = suggest_action(predict[-1], data.Close.iloc[-1])
+    pas_days = data_train.tail(window_size)
+    data_test = pd.concat([pas_days, data_test], ignore_index=True)
+    data_test_scale = scaler.transform(data_test)
 
-   # Additional analysis
-    st.subheader('Analysis') 
-    
-    # Plot predicted vs actual prices
-    st.subheader('Original Price vs Predicted Price')
+    # Prediction
+    predict, y = predict_and_suggest_action(data_test_scale, scaler, window_size)
+    suggested_action = suggest_action(float(predict[-1]), float(data.Close.iloc[-1]))
+
+    # ANALYSIS
+    st.subheader('🔍 Analysis') 
+
+    st.subheader('📉 Original Price vs Predicted Price')
     fig, ax = plt.subplots()
     ax.plot(y, 'r', label='Original Price')
     ax.plot(predict, 'g', label='Predicted Price')
@@ -77,23 +86,22 @@ def main():
     ax.set_ylabel('Price')
     ax.legend()
     st.pyplot(fig)
+    plt.close(fig)
 
-    # Display predicted and actual values
-    st.subheader('Predicted vs Actual Values')
-    results = pd.DataFrame({'Predicted': predict.flatten(), 'Actual': y.flatten()})
+    st.subheader('🧮 Predicted vs Actual Values')
+    results = pd.DataFrame({'Predicted': predict, 'Actual': y})
     st.write(results)
 
-    # Plot historical closing prices
-    st.subheader('Historical Closing Prices')
+    st.subheader('📜 Historical Closing Prices')
     fig_close, ax_close = plt.subplots()
     ax_close.plot(data['Close'], label='Closing Price')
     ax_close.set_xlabel('Date')
     ax_close.set_ylabel('Price')
     ax_close.legend()
     st.pyplot(fig_close)
+    plt.close(fig_close)
 
-    # Plot moving averages
-    st.subheader('Moving Averages')
+    st.subheader('📊 Moving Averages')
     data['MA50'] = data['Close'].rolling(window=50).mean()
     data['MA200'] = data['Close'].rolling(window=200).mean()
     fig_ma, ax_ma = plt.subplots()
@@ -104,9 +112,9 @@ def main():
     ax_ma.set_ylabel('Price')
     ax_ma.legend()
     st.pyplot(fig_ma)
+    plt.close(fig_ma)
 
-    # Plot volatility
-    st.subheader('Volatility')
+    st.subheader('⚠️ Volatility')
     data['Returns'] = data['Close'].pct_change()
     data['Volatility'] = data['Returns'].rolling(window=50).std() * np.sqrt(50)
     fig_vol, ax_vol = plt.subplots()
@@ -115,20 +123,18 @@ def main():
     ax_vol.set_ylabel('Volatility')
     ax_vol.legend()
     st.pyplot(fig_vol)
+    plt.close(fig_vol)
 
-    # Suggested action
-    st.subheader('Suggested Action')
+    st.subheader('✅ Suggested Action')
     if suggested_action == "Buy":
         st.success(f"Suggested Action: {suggested_action}")
     else:
         st.error(f"Suggested Action: {suggested_action}")
 
-    # Display MarketWatch queries
     st.markdown("---")
     st.markdown("Contact Us / support:")
     st.markdown("- click here : https://tradelitcare.streamlit.app ")
 
-    # Horizontal scrolling disclaimer text
     st.markdown("---")
     st.write(
         """
