@@ -1,178 +1,234 @@
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from keras.models import load_model
 import streamlit as st
 import matplotlib.pyplot as plt
-from datetime import datetime
+from datetime import datetime, timedelta
 from sklearn.preprocessing import MinMaxScaler
-import time
 
-# Check if tensorflow/keras is available
-try:
-    from keras.models import load_model
-    KERAS_AVAILABLE = True
-except ImportError:
+@st.cache_resource
+def load_trained_model(path="stockpredict.keras"):
+    # Wrap in try/except to surface friendly error if the file is missing/corrupt
     try:
-        from tensorflow.keras.models import load_model
-        KERAS_AVAILABLE = True
-    except ImportError:
-        KERAS_AVAILABLE = False
-        st.error("❌ Keras/TensorFlow not found. Please add 'tensorflow>=2.13.0' to requirements.txt")
+        m = load_model(path)
+        return m
+    except Exception as e:
+        st.error(f"Failed to load model: {e}")
+        return None
 
-@st.cache_data(ttl=600)  # Cache for 10 minutes
-def download_stock_data_safe(symbol, start, end, max_retries=2):
-    """Safely download stock data with error handling"""
-    for attempt in range(max_retries):
-        try:
-            if attempt > 0:
-                time.sleep(1)  # Brief delay between retries
-            
-            data = yf.download(
-                symbol, 
-                start=start, 
-                end=end, 
-                progress=False,
-                timeout=15
-            )
-            
-            if not data.empty:
-                return data, None
-                
-        except Exception as e:
-            if attempt == max_retries - 1:
-                return None, str(e)
-    
-    return None, "No data available"
+model = load_trained_model("stockpredict.keras")
+
+def predict_and_suggest_action(data_test_scale, scaler, window_size, model):
+    x = []
+    y = []
+    n = data_test_scale.shape[0]
+    if n <= window_size:
+        return np.array([]), np.array([])
+
+    for i in range(window_size, n):
+        x.append(data_test_scale[i - window_size:i])
+        y.append(data_test_scale[i, 0])
+
+    x, y = np.array(x), np.array(y)
+
+    if x.shape[0] == 0:
+        return np.array([]), np.array([])
+
+    predict = model.predict(x, verbose=0)
+
+    # Inverse transform
+    predict = scaler.inverse_transform(predict)
+    y = scaler.inverse_transform(y.reshape(-1, 1)).flatten()
+
+    return predict.flatten(), y
 
 def suggest_action(predicted_price, current_price):
-    """Generate trading suggestion"""
-    change = ((predicted_price - current_price) / current_price) * 100
-    
-    if change > 2:
-        return "Strong Buy", change
-    elif change > 0:
-        return "Buy", change  
-    elif change < -2:
-        return "Strong Sell", change
-    else:
-        return "Hold", change
+    return "Buy" if predicted_price > current_price else "Sell"
 
 def main():
-    st.set_page_config(page_title="Stock Dashboard", page_icon="📈")
-    st.title("📈 Stock Market Dashboard")
-    
-    # Check system requirements
-    if not KERAS_AVAILABLE:
-        st.error("⚠️ **Deployment Issue**: Machine learning model cannot be loaded.")
-        st.info("This appears to be a missing dependency issue. Please check your requirements.txt file.")
-        return
-    
-    # Sidebar inputs
-    st.sidebar.header("Settings")
-    
-    # Stock selection
-    stocks = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'TSLA']
-    selected_stock = st.sidebar.selectbox("Select Stock", stocks)
-    
-    # Date range
-    start_date = st.sidebar.date_input("Start Date", pd.to_datetime('2022-01-01'))
-    end_date = st.sidebar.date_input("End Date", pd.to_datetime('2024-12-31'))
-    
-    if start_date >= end_date:
-        st.error("End date must be after start date")
-        return
-    
-    # Download data
-    with st.spinner(f'Loading {selected_stock} data...'):
-        data, error = download_stock_data_safe(selected_stock, start_date, end_date)
-    
-    if data is None:
-        st.error(f"❌ Could not load data for {selected_stock}")
-        st.write(f"Error: {error}")
-        
-        # Troubleshooting
-        with st.expander("🔧 Troubleshooting"):
-            st.write("""
-            **Common fixes:**
-            1. Try a different stock symbol
-            2. Adjust the date range
-            3. Check internet connection
-            4. Wait a moment and refresh
-            """)
-        return
-    
-    if len(data) < 100:
-        st.warning("⚠️ Limited data available. Results may be less reliable.")
-    
-    # Display basic info
-    st.success(f"✅ Loaded {len(data)} data points for {selected_stock}")
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Current Price", f"${data.Close.iloc[-1]:.2f}")
-    with col2:
-        st.metric("Period High", f"${data.High.max():.2f}")
-    with col3:
-        st.metric("Period Low", f"${data.Low.min():.2f}")
-    
-    # Show recent data
-    st.subheader("Recent Data")
-    st.dataframe(data.tail(10))
-    
-    # Basic analysis without ML model for now
-    st.subheader("📊 Price Analysis")
-    
-    # Calculate moving averages
-    data['MA20'] = data['Close'].rolling(20).mean()
-    data['MA50'] = data['Close'].rolling(50).mean()
-    
-    # Plot
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(data.index, data['Close'], label='Close Price', alpha=0.8)
-    ax.plot(data.index, data['MA20'], label='20-Day MA', alpha=0.7)
-    ax.plot(data.index, data['MA50'], label='50-Day MA', alpha=0.7)
-    ax.set_title(f'{selected_stock} Price History')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    st.pyplot(fig)
-    plt.close()
-    
-    # Simple trend analysis
-    recent_price = data.Close.iloc[-1]
-    ma20_current = data['MA20'].iloc[-1]
-    ma50_current = data['MA50'].iloc[-1]
-    
-    st.subheader("📈 Technical Analysis")
-    
-    # Generate simple signals
-    if recent_price > ma20_current > ma50_current:
-        signal = "Bullish Trend"
-        color = "success"
-    elif recent_price < ma20_current < ma50_current:
-        signal = "Bearish Trend"
-        color = "error"
-    else:
-        signal = "Mixed Signals"
-        color = "warning"
-    
-    if color == "success":
-        st.success(f"✅ {signal}")
-    elif color == "error":
-        st.error(f"🔻 {signal}")
-    else:
-        st.warning(f"⚠️ {signal}")
-    
-    # Volume analysis
-    st.subheader("📊 Volume Analysis")
-    avg_volume = data['Volume'].rolling(20).mean().iloc[-1]
-    recent_volume = data['Volume'].iloc[-1]
-    
-    volume_ratio = recent_volume / avg_volume
-    st.metric("Volume vs 20-Day Average", f"{volume_ratio:.2f}x")
-    
-    # Disclaimer
+    st.title('📈 Stock Market Dashboard')
     st.markdown("---")
-    st.info("⚠️ **Disclaimer**: This is for educational purposes only. Not financial advice.")
+
+    if model is None:
+        st.stop()
+
+    # Validate model input shape for a single 3D sequence input (batch, timesteps, features)
+    try:
+        inp_shape = model.input_shape
+        # handle models with multiple inputs by picking the first
+        if isinstance(inp_shape, list):
+            inp_shape = inp_shape[0]
+        # Expect (None, window_size, features)
+        window_size = inp_shape[1]
+        n_features = inp_shape[2] if len(inp_shape) > 2 else 1
+        if window_size is None or n_features is None or n_features < 1:
+            st.error("Model input shape is invalid or undefined. Expected 3D input.")
+            st.stop()
+    except Exception as e:
+        st.error(f"Could not determine model input shape: {e}")
+        st.stop()
+
+    # Date range
+    st.subheader("Select Data Range to Predict")
+    default_start = pd.to_datetime('2012-01-01')
+    default_end = pd.to_datetime(datetime.now().date())
+    start_date = st.date_input("Start Date", default_start)
+    end_date = st.date_input("End Date", default_end)
+
+    # Convert to pandas Timestamps
+    start_date = pd.to_datetime(start_date)
+    end_date = pd.to_datetime(end_date)
+
+    if start_date >= end_date:
+        st.warning("Start Date must be before End Date.")
+        st.stop()
+
+    # Because yfinance end is exclusive, add 1 day to include the chosen end_date
+    yf_end = end_date + pd.Timedelta(days=1)
+
+    # Select stock
+    selected_stock = st.selectbox('Select Stock Symbol', ['AAPL', 'GOOG', 'MSFT', 'AMZN'])
+
+    # Download data
+    try:
+        data = yf.download(selected_stock, start=start_date, end=yf_end, auto_adjust=False, progress=False)
+    except Exception as e:
+        st.error(f"Error downloading data: {e}")
+        st.stop()
+
+    if data is None or data.empty:
+        st.error("No data found for the selected range/symbol. Try a different date range or stock.")
+        st.stop()
+
+    # Ensure Close exists
+    if 'Close' not in data.columns:
+        st.error("Downloaded data does not contain 'Close' prices.")
+        st.stop()
+
+    st.write(data)
+
+    # Train/test split
+    split_idx = int(len(data) * 0.80)
+    data_train = pd.DataFrame(data['Close'].iloc[:split_idx]).reset_index(drop=True)
+    data_test = pd.DataFrame(data['Close'].iloc[split_idx:]).reset_index(drop=True)
+
+    # Scale
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    try:
+        scaler.fit(data_train)
+    except Exception as e:
+        st.error(f"Scaling failed: {e}")
+        st.stop()
+
+    # Prepare test with past window
+    if len(data_train) < window_size:
+        st.error(f"Not enough training data for the model window size ({window_size}). Increase date range.")
+        st.stop()
+
+    pas_days = data_train.tail(window_size)
+    data_test_full = pd.concat([pas_days, data_test], ignore_index=True)
+
+    # Model expects features dimension; our series has shape (n, 1)
+    try:
+        data_test_scale = scaler.transform(data_test_full)
+    except Exception as e:
+        st.error(f"Scaling transform failed: {e}")
+        st.stop()
+
+    # Prediction
+    predict, y = predict_and_suggest_action(data_test_scale, scaler, window_size, model)
+
+    # Suggested action based on last predicted vs last actual close
+    last_close = float(data['Close'].iloc[-1])
+    if predict.size > 0:
+        suggested_action = suggest_action(float(predict[-1]), last_close)
+    else:
+        suggested_action = None
+
+    # ANALYSIS
+    st.subheader('🔍 Analysis')
+
+    st.subheader('📉 Original Price vs Predicted Price')
+    if predict.size == 0 or y.size == 0:
+        st.info("Not enough data to generate predictions with the current window size and date range.")
+    else:
+        fig, ax = plt.subplots()
+        ax.plot(y, 'r', label='Original Price')
+        ax.plot(predict, 'g', label='Predicted Price')
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Price')
+        ax.legend()
+        st.pyplot(fig)
+        plt.close(fig)
+
+        st.subheader('🧮 Predicted vs Actual Values')
+        results = pd.DataFrame({'Predicted': predict, 'Actual': y})
+        st.write(results)
+
+    st.subheader('📜 Historical Closing Prices')
+    fig_close, ax_close = plt.subplots()
+    ax_close.plot(data['Close'], label='Closing Price')
+    ax_close.set_xlabel('Date')
+    ax_close.set_ylabel('Price')
+    ax_close.legend()
+    st.pyplot(fig_close)
+    plt.close(fig_close)
+
+    st.subheader('📊 Moving Averages')
+    data_ma = data.copy()
+    data_ma['MA50'] = data_ma['Close'].rolling(window=50).mean()
+    data_ma['MA200'] = data_ma['Close'].rolling(window=200).mean()
+    fig_ma, ax_ma = plt.subplots()
+    ax_ma.plot(data_ma['Close'], label='Closing Price')
+    ax_ma.plot(data_ma['MA50'], label='50-Day MA')
+    ax_ma.plot(data_ma['MA200'], label='200-Day MA')
+    ax_ma.set_xlabel('Date')
+    ax_ma.set_ylabel('Price')
+    ax_ma.legend()
+    st.pyplot(fig_ma)
+    plt.close(fig_ma)
+
+    st.subheader('⚠️ Volatility')
+    data_vol = data.copy()
+    data_vol['Returns'] = data_vol['Close'].pct_change()
+    data_vol['Volatility'] = data_vol['Returns'].rolling(window=50).std() * np.sqrt(50)
+    fig_vol, ax_vol = plt.subplots()
+    ax_vol.plot(data_vol['Volatility'], label='Volatility')
+    ax_vol.set_xlabel('Date')
+    ax_vol.set_ylabel('Volatility')
+    ax_vol.legend()
+    st.pyplot(fig_vol)
+    plt.close(fig_vol)
+
+    st.subheader('✅ Suggested Action')
+    if suggested_action is None:
+        st.info("No suggestion available because predictions were not generated.")
+    else:
+        if suggested_action == "Buy":
+            st.success(f"Suggested Action: {suggested_action}")
+        else:
+            st.error(f"Suggested Action: {suggested_action}")
+
+    st.markdown("---")
+    st.markdown("Contact Us / support:")
+    st.markdown("- click here : https://tradelitcare.streamlit.app ")
+
+    st.markdown("---")
+    st.write(
+        """
+        <div style="overflow-x: auto; white-space: nowrap;">
+            <marquee behavior="scroll" direction="left" scrollamount="5">
+                Intraday Data provided by FACTSET and subject to terms of use. 
+                Historical and current end-of-day data provided by FACTSET. 
+                All quotes are in local exchange time. Real-time last sale data for U.S. 
+                stock quotes reflect trades reported through Nasdaq only. 
+                Intraday data delayed at least 15 minutes or per exchange requirements.
+            </marquee>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 if __name__ == "__main__":
     main()
