@@ -1,234 +1,204 @@
+import os
+import tempfile
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from keras.models import load_model
+try:
+    from tensorflow.keras.models import load_model
+except Exception:
+    # If TF not installed, we'll still allow demo mode
+    load_model = None
+
 import streamlit as st
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
 from sklearn.preprocessing import MinMaxScaler
 
-@st.cache_resource
-def load_trained_model(path="stockpredict.keras"):
-    # Wrap in try/except to surface friendly error if the file is missing/corrupt
+st.set_page_config(layout="wide")
+
+# ---------------------------
+# Utility / fallback classes
+# ---------------------------
+class FallbackModel:
+    """Very small fallback predictor: predicts next scaled value as window mean with slight drift."""
+    def predict(self, x):
+        # expects x shape (samples, window_size, 1)
+        window_means = x.mean(axis=1).reshape(-1, 1)
+        return window_means * 1.0005
+
+@st.cache_data(ttl=600)
+def download_data(symbol, start, end):
+    """Download via yfinance and return DataFrame. Returns None on failure."""
     try:
-        m = load_model(path)
-        return m
-    except Exception as e:
-        st.error(f"Failed to load model: {e}")
+        df = yf.download(symbol, start=start, end=end)
+        if df.empty:
+            return None
+        return df
+    except Exception:
         return None
 
-model = load_trained_model("stockpredict.keras")
+def build_windows(scaled_series, window_size):
+    x, y = [], []
+    for i in range(window_size, scaled_series.shape[0]):
+        x.append(scaled_series[i - window_size:i].reshape(window_size, 1))
+        y.append(scaled_series[i, 0])
+    return np.array(x), np.array(y)
 
-def predict_and_suggest_action(data_test_scale, scaler, window_size, model):
-    x = []
-    y = []
-    n = data_test_scale.shape[0]
-    if n <= window_size:
-        return np.array([]), np.array([])
+def safe_inverse(scaler, arr):
+    arr2 = np.array(arr).reshape(-1, 1)
+    return scaler.inverse_transform(arr2).flatten()
 
-    for i in range(window_size, n):
-        x.append(data_test_scale[i - window_size:i])
-        y.append(data_test_scale[i, 0])
+# ---------------------------
+# Streamlit UI
+# ---------------------------
+st.title("📈 Stock Market Dashboard (robust demo)")
+st.markdown("---")
 
-    x, y = np.array(x), np.array(y)
+# Options
+col1, col2 = st.columns([2, 1])
+with col1:
+    start_date = st.date_input("Start Date", pd.to_datetime("2012-01-01"))
+    end_date = st.date_input("End Date", pd.to_datetime("2022-12-31"))
+    symbol = st.selectbox("Select Stock", ["AAPL", "GOOG", "MSFT", "AMZN"])
+    use_demo = st.checkbox("Demo mode (use synthetic data if download or model fails)", value=False)
 
-    if x.shape[0] == 0:
-        return np.array([]), np.array([])
+with col2:
+    uploaded_model = st.file_uploader("Upload your Keras model (.keras / .h5) (optional)", type=['keras','h5','keras'])
+    window_size_user = st.slider("Window size (override)", min_value=5, max_value=300, value=60)
 
-    predict = model.predict(x, verbose=0)
-
-    # Inverse transform
-    predict = scaler.inverse_transform(predict)
-    y = scaler.inverse_transform(y.reshape(-1, 1)).flatten()
-
-    return predict.flatten(), y
-
-def suggest_action(predicted_price, current_price):
-    return "Buy" if predicted_price > current_price else "Sell"
-
-def main():
-    st.title('📈 Stock Market Dashboard')
-    st.markdown("---")
-
-    if model is None:
-        st.stop()
-
-    # Validate model input shape for a single 3D sequence input (batch, timesteps, features)
-    try:
-        inp_shape = model.input_shape
-        # handle models with multiple inputs by picking the first
-        if isinstance(inp_shape, list):
-            inp_shape = inp_shape[0]
-        # Expect (None, window_size, features)
-        window_size = inp_shape[1]
-        n_features = inp_shape[2] if len(inp_shape) > 2 else 1
-        if window_size is None or n_features is None or n_features < 1:
-            st.error("Model input shape is invalid or undefined. Expected 3D input.")
-            st.stop()
-    except Exception as e:
-        st.error(f"Could not determine model input shape: {e}")
-        st.stop()
-
-    # Date range
-    st.subheader("Select Data Range to Predict")
-    default_start = pd.to_datetime('2012-01-01')
-    default_end = pd.to_datetime(datetime.now().date())
-    start_date = st.date_input("Start Date", default_start)
-    end_date = st.date_input("End Date", default_end)
-
-    # Convert to pandas Timestamps
-    start_date = pd.to_datetime(start_date)
-    end_date = pd.to_datetime(end_date)
-
-    if start_date >= end_date:
-        st.warning("Start Date must be before End Date.")
-        st.stop()
-
-    # Because yfinance end is exclusive, add 1 day to include the chosen end_date
-    yf_end = end_date + pd.Timedelta(days=1)
-
-    # Select stock
-    selected_stock = st.selectbox('Select Stock Symbol', ['AAPL', 'GOOG', 'MSFT', 'AMZN'])
-
-    # Download data
-    try:
-        data = yf.download(selected_stock, start=start_date, end=yf_end, auto_adjust=False, progress=False)
-    except Exception as e:
-        st.error(f"Error downloading data: {e}")
-        st.stop()
-
-    if data is None or data.empty:
-        st.error("No data found for the selected range/symbol. Try a different date range or stock.")
-        st.stop()
-
-    # Ensure Close exists
-    if 'Close' not in data.columns:
-        st.error("Downloaded data does not contain 'Close' prices.")
-        st.stop()
-
-    st.write(data)
-
-    # Train/test split
-    split_idx = int(len(data) * 0.80)
-    data_train = pd.DataFrame(data['Close'].iloc[:split_idx]).reset_index(drop=True)
-    data_test = pd.DataFrame(data['Close'].iloc[split_idx:]).reset_index(drop=True)
-
-    # Scale
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    try:
-        scaler.fit(data_train)
-    except Exception as e:
-        st.error(f"Scaling failed: {e}")
-        st.stop()
-
-    # Prepare test with past window
-    if len(data_train) < window_size:
-        st.error(f"Not enough training data for the model window size ({window_size}). Increase date range.")
-        st.stop()
-
-    pas_days = data_train.tail(window_size)
-    data_test_full = pd.concat([pas_days, data_test], ignore_index=True)
-
-    # Model expects features dimension; our series has shape (n, 1)
-    try:
-        data_test_scale = scaler.transform(data_test_full)
-    except Exception as e:
-        st.error(f"Scaling transform failed: {e}")
-        st.stop()
-
-    # Prediction
-    predict, y = predict_and_suggest_action(data_test_scale, scaler, window_size, model)
-
-    # Suggested action based on last predicted vs last actual close
-    last_close = float(data['Close'].iloc[-1])
-    if predict.size > 0:
-        suggested_action = suggest_action(float(predict[-1]), last_close)
-    else:
-        suggested_action = None
-
-    # ANALYSIS
-    st.subheader('🔍 Analysis')
-
-    st.subheader('📉 Original Price vs Predicted Price')
-    if predict.size == 0 or y.size == 0:
-        st.info("Not enough data to generate predictions with the current window size and date range.")
-    else:
-        fig, ax = plt.subplots()
-        ax.plot(y, 'r', label='Original Price')
-        ax.plot(predict, 'g', label='Predicted Price')
-        ax.set_xlabel('Time')
-        ax.set_ylabel('Price')
-        ax.legend()
-        st.pyplot(fig)
-        plt.close(fig)
-
-        st.subheader('🧮 Predicted vs Actual Values')
-        results = pd.DataFrame({'Predicted': predict, 'Actual': y})
-        st.write(results)
-
-    st.subheader('📜 Historical Closing Prices')
-    fig_close, ax_close = plt.subplots()
-    ax_close.plot(data['Close'], label='Closing Price')
-    ax_close.set_xlabel('Date')
-    ax_close.set_ylabel('Price')
-    ax_close.legend()
-    st.pyplot(fig_close)
-    plt.close(fig_close)
-
-    st.subheader('📊 Moving Averages')
-    data_ma = data.copy()
-    data_ma['MA50'] = data_ma['Close'].rolling(window=50).mean()
-    data_ma['MA200'] = data_ma['Close'].rolling(window=200).mean()
-    fig_ma, ax_ma = plt.subplots()
-    ax_ma.plot(data_ma['Close'], label='Closing Price')
-    ax_ma.plot(data_ma['MA50'], label='50-Day MA')
-    ax_ma.plot(data_ma['MA200'], label='200-Day MA')
-    ax_ma.set_xlabel('Date')
-    ax_ma.set_ylabel('Price')
-    ax_ma.legend()
-    st.pyplot(fig_ma)
-    plt.close(fig_ma)
-
-    st.subheader('⚠️ Volatility')
-    data_vol = data.copy()
-    data_vol['Returns'] = data_vol['Close'].pct_change()
-    data_vol['Volatility'] = data_vol['Returns'].rolling(window=50).std() * np.sqrt(50)
-    fig_vol, ax_vol = plt.subplots()
-    ax_vol.plot(data_vol['Volatility'], label='Volatility')
-    ax_vol.set_xlabel('Date')
-    ax_vol.set_ylabel('Volatility')
-    ax_vol.legend()
-    st.pyplot(fig_vol)
-    plt.close(fig_vol)
-
-    st.subheader('✅ Suggested Action')
-    if suggested_action is None:
-        st.info("No suggestion available because predictions were not generated.")
-    else:
-        if suggested_action == "Buy":
-            st.success(f"Suggested Action: {suggested_action}")
+# Load data
+with st.spinner("Getting historical data..."):
+    data = download_data(symbol, start_date, end_date)
+    if data is None:
+        if use_demo:
+            st.warning("Couldn't download data; using synthetic demo data.")
+            n = 400
+            rng = np.random.default_rng(123)
+            prices = 100 + np.cumsum(rng.normal(loc=0.2, scale=1.0, size=n))
+            dates = pd.date_range(end=pd.Timestamp.today(), periods=n)
+            data = pd.DataFrame({"Close": prices}, index=dates)
         else:
-            st.error(f"Suggested Action: {suggested_action}")
+            st.error("Could not download data. Turn on demo mode or check network.")
+            st.stop()
 
-    st.markdown("---")
-    st.markdown("Contact Us / support:")
-    st.markdown("- click here : https://tradelitcare.streamlit.app ")
+# show basic data
+st.subheader("Sample data")
+st.dataframe(data.head())
 
-    st.markdown("---")
-    st.write(
-        """
-        <div style="overflow-x: auto; white-space: nowrap;">
-            <marquee behavior="scroll" direction="left" scrollamount="5">
-                Intraday Data provided by FACTSET and subject to terms of use. 
-                Historical and current end-of-day data provided by FACTSET. 
-                All quotes are in local exchange time. Real-time last sale data for U.S. 
-                stock quotes reflect trades reported through Nasdaq only. 
-                Intraday. data delayed at least 15 minutes or per exchange requirements.
-            </marquee>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+# Try loading model (uploaded or local path)
+model_obj = None
+model_window_size = None
+if uploaded_model is not None and load_model is not None:
+    # save to temp and load
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".keras")
+    tmp.write(uploaded_model.getbuffer())
+    tmp.flush()
+    tmp.close()
+    try:
+        model_obj = load_model(tmp.name)
+        st.success("Model loaded from upload.")
+    except Exception as e:
+        st.warning(f"Uploaded model could not be loaded: {e}")
+        model_obj = None
+    finally:
+        try:
+            os.remove(tmp.name)
+        except Exception:
+            pass
+elif os.path.exists("stockpredict.keras") and load_model is not None:
+    try:
+        model_obj = load_model("stockpredict.keras")
+        st.success("Model loaded from disk (stockpredict.keras).")
+    except Exception as e:
+        st.warning(f"Failed to load stockpredict.keras: {e}")
+        model_obj = None
+else:
+    if load_model is None:
+        st.info("TensorFlow/Keras not available in this environment; using fallback predictor if needed.")
 
-if __name__ == "__main__":
-    main()
+# Determine window size
+if model_obj is not None:
+    try:
+        # handle different possible shapes: (None, window_size, features)
+        inp_shape = model_obj.input_shape
+        if isinstance(inp_shape, tuple) and len(inp_shape) >= 2:
+            model_window_size = int(inp_shape[1])
+    except Exception:
+        model_window_size = None
+
+window_size = model_window_size or window_size_user
+
+if len(data) < window_size + 1:
+    st.error(f"Not enough data for window_size={window_size}. Need at least {window_size+1} rows.")
+    st.stop()
+
+# Prepare train/test
+data_train = pd.DataFrame(data['Close'].iloc[: int(len(data) * 0.80)])
+data_test = pd.DataFrame(data['Close'].iloc[int(len(data) * 0.80):])
+
+scaler = MinMaxScaler(feature_range=(0, 1))
+scaler.fit(data_train[['Close']])
+
+# prefix test with last window_size from train
+past_days = data_train.tail(window_size)
+data_test_full = pd.concat([past_days, data_test], ignore_index=True)
+
+data_test_scale = scaler.transform(data_test_full[['Close']])
+
+# Build windows
+x, y = build_windows(data_test_scale, window_size)
+
+if x.size == 0:
+    st.error("After windowing, no samples were created. Check window size vs data length.")
+    st.stop()
+
+# choose model to predict
+predictor = None
+if model_obj is not None:
+    predictor = model_obj
+else:
+    predictor = FallbackModel()
+    st.info("Using fallback predictor (demo).")
+
+# Predict
+try:
+    pred_scaled = predictor.predict(x)  # predictor must return shape (n_samples, 1) or (n_samples,)
+    pred = safe_inverse(scaler, pred_scaled)
+    y_inv = safe_inverse(scaler, y)
+except Exception as e:
+    st.error(f"Prediction failed: {e}")
+    st.stop()
+
+# Suggested action using last predicted vs last close
+last_pred = float(pred[-1])
+last_close = float(data_test_full['Close'].iloc[-1])
+suggested_action = "Buy" if last_pred > last_close else "Sell"
+
+# Output: plots + tables
+st.subheader("🔍 Predicted vs Actual (test portion)")
+results = pd.DataFrame({'Predicted': pred, 'Actual': y_inv})
+st.dataframe(results.tail(10))
+
+fig, ax = plt.subplots()
+ax.plot(results['Actual'], label='Actual')
+ax.plot(results['Predicted'], label='Predicted')
+ax.set_xlabel("Samples")
+ax.set_ylabel("Price")
+ax.legend()
+st.pyplot(fig)
+
+st.subheader("📜 Historical Closing Prices")
+fig2, ax2 = plt.subplots()
+ax2.plot(data['Close'], label='Closing Price')
+ax2.set_xlabel("Date")
+ax2.set_ylabel("Price")
+ax2.legend()
+st.pyplot(fig2)
+
+st.subheader("✅ Suggested Action")
+if suggested_action == "Buy":
+    st.success(f"Suggested Action: {suggested_action} — Predicted {last_pred:.2f} vs Current {last_close:.2f}")
+else:
+    st.error(f"Suggested Action: {suggested_action} — Predicted {last_pred:.2f} vs Current {last_close:.2f}")
+
+st.markdown("---")
+st.markdown("Contact / Support: https://tradelitcare.streamlit.app")
