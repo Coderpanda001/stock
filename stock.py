@@ -223,7 +223,7 @@ def main():
                 Historical and current end-of-day data provided by FACTSET. 
                 All quotes are in local exchange time. Real-time last sale data for U.S. 
                 stock quotes reflect trades reported through Nasdaq only. 
-                Intraday data delayed at least 15 minutes or per exchange requirements.
+                Intraday. data delayed at least 15 minutes or per exchange requirements.
             </marquee>
         </div>
         """,
